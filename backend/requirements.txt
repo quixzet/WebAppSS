@@ -1,15 +1,18 @@
-# Backend зависимости для приложения расписания
+# Backend зависимости для приложения расписания СИЭУиП
+# Установка: pip install -r requirements.txt
 
 # Web framework
 fastapi==0.104.0
 uvicorn[standard]==0.24.0
 
-# Парсинг
+# Парсинг HTML
 beautifulsoup4==4.12.2
-pdfplumber==0.10.3
 lxml==4.9.4
 
-# HTTP клиент
+# Парсинг PDF
+pdfplumber==0.10.3
+
+# HTTP клиент (асинхронный)
 aiohttp==3.9.1
 
 # Планировщик задач
@@ -17,10 +20,6 @@ apscheduler==3.10.4
 
 # Валидация данных
 pydantic==2.5.0
-
-# База данных
-# sqlalchemy==2.0.23  # Опционально, для PostgreSQL
-# asyncpg==0.29.0     # Опционально, для PostgreSQL
 
 # Утилиты
 python-dotenv==1.0.0
