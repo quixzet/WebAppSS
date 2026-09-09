@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Расписание занятий</title>
+    <!-- Telegram WebApp Script -->
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <meta name="theme-color" content="#3B82F6" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"
+    />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+      }
+      html.light,
+      html.light body {
+        background-color: #f8fafc !important;
+        color: #0f172a;
+      }
+      html.dark,
+      html.dark body {
+        background-color: #0f172a !important;
+        color: #f1f5f9;
+      }
+    </style>
+    <script>
+      (function () {
+        const isInIframe = window.self !== window.top;
+
+        function applyThemeToDOM(theme) {
+          document.documentElement.classList.remove("light", "dark");
+          document.documentElement.classList.add(theme);
+          document.documentElement.setAttribute("data-theme", theme);
+        }
+
+        // Проверяем Telegram WebApp
+        if (window.Telegram && window.Telegram.WebApp) {
+          const tg = window.Telegram.WebApp;
+          tg.expand();
+          
+          // Используем цветовую схему Telegram
+          const colorScheme = tg.colorScheme || 'light';
+          applyThemeToDOM(colorScheme);
+          
+          // Слушаем изменения темы от Telegram
+          tg.onEvent('themeChanged', function() {
+            applyThemeToDOM(tg.colorScheme);
+          });
+        } else if (isInIframe) {
+          window.addEventListener("message", function (event) {
+            if (event.data && typeof event.data.theme === "string") {
+              const theme = event.data.theme;
+              if (theme === "light" || theme === "dark") {
+                applyThemeToDOM(theme);
+              }
+            }
+          });
+          applyThemeToDOM("light");
+        } else {
+          // Определяем тему из системных настроек
+          const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+          const saved = localStorage.getItem('theme');
+          if (saved) {
+            applyThemeToDOM(saved);
+          } else {
+            applyThemeToDOM(prefersDark ? 'dark' : 'light');
+          }
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
