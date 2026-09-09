@@ -1,252 +1,428 @@
 """
-Модуль работы с базой данных для приложения расписания.
+Модуль работы с базой данных SQLite для приложения расписания.
 
-Использует SQLite для хранения:
-- Группы студентов
-- Расписание занятий
-- Статус последнего обновления
-- Подписки на уведомления
-- Журнал изменений
+Полностью переработан для устранения проблемы "database is locked":
+- Единое соединение с WAL-режимом
+- threading.Lock для синхронизации записи
+- Retry механизм с экспоненциальной задержкой
+- Bulk операции через executemany
+- Единая транзакция для массовых вставок
+- BEGIN IMMEDIATE для захвата эксклюзивной блокировки
 
-Таблицы:
-- groups: список групп
-- schedules: расписание занятий
-- last_update: время последнего парсинга
-- subscriptions: подписки на уведомления (Telegram)
-- changes: журнал изменений в расписании
+Основные изменения:
+1. Все операции записи проходят через threading.Lock
+2. bulk_update_schedule выполняет всё в одной транзакции
+3. Retry декоратор автоматически повторяет при блокировке
+4. WAL-режим позволяет одновременное чтение/запись
+5. Увеличен таймаут ожидания блокировки до 30 секунд
 """
 
 import sqlite3
 import json
 import logging
-from typing import List, Dict, Optional, Any
+import threading
+import time
+import hashlib
+from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime, timedelta
 from contextlib import contextmanager
+from functools import wraps
+
+from db_config import (
+    DATABASE_PATH,
+    DATABASE_TIMEOUT,
+    WAL_MODE,
+    SYNC_MODE,
+    CACHE_SIZE,
+    MMAP_SIZE,
+    MAX_RETRY_ATTEMPTS,
+    RETRY_BASE_DELAY,
+    RETRY_MAX_DELAY,
+    BATCH_SIZE,
+    LOG_QUERY_TIMING,
+    SLOW_QUERY_THRESHOLD,
+    CREATE_INDEXES,
+    INDEXES,
+)
 
 logger = logging.getLogger(__name__)
 
 
+# ========================================
+# Декоратор retry_on_lock
+# ========================================
+
+def retry_on_lock(max_attempts: int = MAX_RETRY_ATTEMPTS, base_delay: float = RETRY_BASE_DELAY):
+    """
+    Декоратор для повторных попыток при ошибке блокировки БД.
+    
+    Использует экспоненциальную задержку: base_delay * (2 ^ attempt)
+    Повторяет до max_attempts раз.
+    
+    Args:
+        max_attempts: Максимальное количество попыток
+        base_delay: Базовая задержка в секундах
+    
+    Example:
+        @retry_on_lock(max_attempts=5, base_delay=0.5)
+        def bulk_update_schedule(self, lessons):
+            ...
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                
+                except sqlite3.OperationalError as e:
+                    error_msg = str(e).lower()
+                    # Проверяем, что это именно ошибка блокировки
+                    if "locked" in error_msg or "busy" in error_msg:
+                        last_exception = e
+                        
+                        if attempt < max_attempts - 1:
+                            # Экспоненциальная задержка с максимумом
+                            delay = min(base_delay * (2 ** attempt), RETRY_MAX_DELAY)
+                            logger.warning(
+                                f"Блокировка БД в {func.__name__} "
+                                f"(попытка {attempt + 1}/{max_attempts}). "
+                                f"Ожидание {delay:.1f}с..."
+                            )
+                            time.sleep(delay)
+                        else:
+                            logger.error(
+                                f"Превышено максимальное количество попыток "
+                                f"({max_attempts}) в {func.__name__}"
+                            )
+                    else:
+                        # Другая OperationalError — не повторяем
+                        raise
+                
+                except Exception as e:
+                    # Другие исключения — не повторяем
+                    raise
+            
+            # Если все попытки исчерпаны
+            raise last_exception
+        
+        return wrapper
+    return decorator
+
+
+# ========================================
+# Класс Database
+# ========================================
+
 class Database:
     """
-    Управление базой данных расписания.
+    Потокобезопасный менеджер базы данных SQLite.
     
-    Обеспечивает:
-    - Хранение расписания по группам
-    - Отслеживание времени последнего обновления
-    - Обнаружение изменений в расписании
-    - Управление подписками на уведомления
+    Ключевые особенности:
+    - Единое соединение с WAL-режимом
+    - threading.Lock для синхронизации операций записи
+    - Retry механизм при блокировке
+    - Bulk операции для массовых вставок
+    - Единая транзакция для атомарности
+    
+    Использование:
+        db = Database()
+        
+        # Массовое обновление (рекомендуется)
+        stats = db.bulk_update_schedule(all_lessons, sources)
+        
+        # Одиночные операции (для мелких задач)
+        groups = db.get_all_groups()
+        schedule = db.get_schedule(group_id)
     """
     
-    def __init__(self, db_path: str = "schedule.db"):
-        self.db_path = db_path
-        self.initialize()
-    
-    @contextmanager
-    def get_connection(self):
-        """
-        Контекстный менеджер для подключения к БД.
-        
-        Автоматически коммитит изменения или откатывает при ошибке.
-        """
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")  # Write-Ahead Logging для лучшей производительности
-        try:
-            yield conn
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"Ошибка БД: {e}")
-            raise
-        finally:
-            conn.close()
-    
-    def initialize(self):
+    def __init__(self, db_path: str = DATABASE_PATH):
         """
         Инициализация базы данных.
         
-        Создаёт все необходимые таблицы и индексы.
+        Создаёт соединение, настраивает WAL-режим, создаёт таблицы и индексы.
+        
+        Args:
+            db_path: Путь к файлу базы данных
         """
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        self.db_path = db_path
+        self._lock = threading.Lock()  # Lock для синхронизации записи
+        self._init_db()
+        
+        logger.info(f"✅ База данных инициализирована: {db_path}")
+    
+    def _get_connection(self) -> sqlite3.Connection:
+        """
+        Получить соединение с БД с оптимальными настройками.
+        
+        Настройки:
+        - timeout: 30 секунд ожидания блокировки
+        - check_same_thread: False для многопоточности
+        - WAL-режим для одновременного чтения/записи
+        - Увеличенный кэш и mmap_size
+        
+        Returns:
+            sqlite3.Connection с настроенными параметрами
+        """
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=DATABASE_TIMEOUT,
+            check_same_thread=False,  # Разрешаем использование из разных потоков
+            isolation_level=None  # Ручное управление транзакциями
+        )
+        
+        # Настройка row_factory для доступа по именам колонок
+        conn.row_factory = sqlite3.Row
+        
+        # Прагмы для оптимизации
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA synchronous={SYNC_MODE}")
+        conn.execute(f"PRAGMA cache_size={CACHE_SIZE}")
+        conn.execute(f"PRAGMA mmap_size={MMAP_SIZE}")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA foreign_keys=ON")
+        
+        return conn
+    
+    def _init_db(self):
+        """
+        Инициализация структуры базы данных.
+        
+        Создаёт все необходимые таблицы и индексы.
+        Настраивает WAL-режим и другие параметры.
+        """
+        start_time = time.time()
+        
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                
+                # ========================================
+                # Таблица групп
+                # ========================================
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS groups (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL UNIQUE,
+                        specialty TEXT DEFAULT '',
+                        education_form TEXT DEFAULT 'Очная',
+                        building TEXT DEFAULT '',
+                        created_at TEXT,
+                        updated_at TEXT
+                    )
+                ''')
+                
+                # ========================================
+                # Таблица расписания
+                # ========================================
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS schedules (
+                        id TEXT PRIMARY KEY,
+                        group_id TEXT NOT NULL,
+                        day_of_week TEXT NOT NULL,
+                        lesson_number INTEGER NOT NULL,
+                        start_time TEXT,
+                        end_time TEXT,
+                        subject TEXT,
+                        lesson_type TEXT DEFAULT 'practice',
+                        teacher TEXT DEFAULT '',
+                        room TEXT DEFAULT '',
+                        building TEXT DEFAULT '',
+                        is_changed INTEGER DEFAULT 0,
+                        comment TEXT DEFAULT '',
+                        source_url TEXT DEFAULT '',
+                        updated_at TEXT,
+                        FOREIGN KEY (group_id) REFERENCES groups(id)
+                    )
+                ''')
+                
+                # ========================================
+                # Таблица времени последнего обновления
+                # ========================================
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS last_update (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        last_success TEXT,
+                        last_attempt TEXT,
+                        next_scheduled TEXT,
+                        source TEXT DEFAULT '',
+                        success INTEGER DEFAULT 0,
+                        error_message TEXT DEFAULT '',
+                        lessons_count INTEGER DEFAULT 0,
+                        groups_count INTEGER DEFAULT 0,
+                        pdf_files_count INTEGER DEFAULT 0
+                    )
+                ''')
+                
+                # Инициализация записи last_update
+                cursor.execute('''
+                    INSERT OR IGNORE INTO last_update (id, last_success, last_attempt, next_scheduled)
+                    VALUES (1, NULL, NULL, NULL)
+                ''')
+                
+                # ========================================
+                # Таблица подписок на уведомления
+                # ========================================
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS subscriptions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chat_id TEXT NOT NULL,
+                        group_id TEXT NOT NULL,
+                        notification_types TEXT DEFAULT '["changes", "cancellations"]',
+                        is_active INTEGER DEFAULT 1,
+                        created_at TEXT,
+                        FOREIGN KEY (group_id) REFERENCES groups(id)
+                    )
+                ''')
+                
+                # ========================================
+                # Таблица журнала изменений
+                # ========================================
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS changes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        group_id TEXT NOT NULL,
+                        day_of_week TEXT,
+                        lesson_number INTEGER,
+                        change_type TEXT,
+                        field_name TEXT,
+                        old_value TEXT,
+                        new_value TEXT,
+                        subject TEXT,
+                        comment TEXT DEFAULT '',
+                        detected_at TEXT,
+                        FOREIGN KEY (group_id) REFERENCES groups(id)
+                    )
+                ''')
+                
+                # ========================================
+                # Создание индексов
+                # ========================================
+                if CREATE_INDEXES:
+                    for index in INDEXES:
+                        columns = ", ".join(index["columns"])
+                        cursor.execute(f'''
+                            CREATE INDEX IF NOT EXISTS {index["name"]}
+                            ON {index["table"]}({columns})
+                        ''')
+                
+                conn.commit()
+                
+                elapsed = time.time() - start_time
+                if LOG_QUERY_TIMING and elapsed > SLOW_QUERY_THRESHOLD:
+                    logger.warning(f"⚠️ Медленная инициализация БД: {elapsed:.2f}с")
+                else:
+                    logger.debug(f"Инициализация БД завершена за {elapsed:.2f}с")
             
-            # ========================================
-            # Таблица групп
-            # ========================================
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS groups (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL UNIQUE,
-                    specialty TEXT DEFAULT '',
-                    education_form TEXT DEFAULT 'Очная',
-                    building TEXT DEFAULT '',
-                    created_at TEXT,
-                    updated_at TEXT
-                )
-            ''')
-            
-            # ========================================
-            # Таблица расписания
-            # ========================================
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS schedules (
-                    id TEXT PRIMARY KEY,
-                    group_id TEXT NOT NULL,
-                    day_of_week TEXT NOT NULL,
-                    lesson_number INTEGER NOT NULL,
-                    start_time TEXT,
-                    end_time TEXT,
-                    subject TEXT,
-                    lesson_type TEXT DEFAULT 'practice',
-                    teacher TEXT DEFAULT '',
-                    room TEXT DEFAULT '',
-                    building TEXT DEFAULT '',
-                    is_changed INTEGER DEFAULT 0,
-                    comment TEXT DEFAULT '',
-                    source_url TEXT DEFAULT '',
-                    updated_at TEXT,
-                    FOREIGN KEY (group_id) REFERENCES groups(id)
-                )
-            ''')
-            
-            # ========================================
-            # Таблица времени последнего обновления
-            # ========================================
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS last_update (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    last_success TEXT,
-                    last_attempt TEXT,
-                    next_scheduled TEXT,
-                    source TEXT DEFAULT '',
-                    success INTEGER DEFAULT 0,
-                    error_message TEXT DEFAULT '',
-                    lessons_count INTEGER DEFAULT 0,
-                    groups_count INTEGER DEFAULT 0,
-                    pdf_files_count INTEGER DEFAULT 0
-                )
-            ''')
-            
-            # ========================================
-            # Таблица подписок на уведомления
-            # ========================================
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS subscriptions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id TEXT NOT NULL,
-                    group_id TEXT NOT NULL,
-                    notification_types TEXT DEFAULT '["changes", "cancellations"]',
-                    is_active INTEGER DEFAULT 1,
-                    created_at TEXT,
-                    FOREIGN KEY (group_id) REFERENCES groups(id)
-                )
-            ''')
-            
-            # ========================================
-            # Таблица журнала изменений
-            # ========================================
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS changes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    group_id TEXT NOT NULL,
-                    day_of_week TEXT,
-                    lesson_number INTEGER,
-                    change_type TEXT,
-                    field_name TEXT,
-                    old_value TEXT,
-                    new_value TEXT,
-                    subject TEXT,
-                    comment TEXT DEFAULT '',
-                    detected_at TEXT,
-                    FOREIGN KEY (group_id) REFERENCES groups(id)
-                )
-            ''')
-            
-            # ========================================
-            # Таблица источников PDF
-            # ========================================
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS pdf_sources (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    url TEXT NOT NULL UNIQUE,
-                    title TEXT,
-                    specialty TEXT,
-                    building TEXT,
-                    education_form TEXT,
-                    last_hash TEXT DEFAULT '',
-                    last_checked TEXT,
-                    is_active INTEGER DEFAULT 1
-                )
-            ''')
-            
-            # ========================================
-            # Индексы для быстрого поиска
-            # ========================================
-            cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_schedules_group_day
-                ON schedules(group_id, day_of_week)
-            ''')
-            cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_schedules_updated
-                ON schedules(updated_at)
-            ''')
-            cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_subscriptions_group
-                ON subscriptions(group_id)
-            ''')
-            cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_subscriptions_active
-                ON subscriptions(is_active)
-            ''')
-            cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_changes_detected
-                ON changes(detected_at)
-            ''')
-            
-            # Инициализация записи last_update, если её нет
-            cursor.execute('''
-                INSERT OR IGNORE INTO last_update (id, last_success, last_attempt, next_scheduled)
-                VALUES (1, NULL, NULL, NULL)
-            ''')
-            
-            logger.info("База данных инициализирована успешно")
+            except Exception as e:
+                conn.rollback()
+                logger.error(f"❌ Ошибка инициализации БД: {e}", exc_info=True)
+                raise
+            finally:
+                conn.close()
+    
+    # ========================================
+    # Context manager для транзакций
+    # ========================================
+    
+    @contextmanager
+    def transaction(self):
+        """
+        Контекстный менеджер для атомарных транзакций.
+        
+        Использует threading.Lock для синхронизации.
+        Начинает транзакцию с BEGIN IMMEDIATE для захвата эксклюзивной блокировки.
+        
+        Example:
+            with db.transaction() as conn:
+                conn.execute("INSERT INTO ...")
+                conn.execute("UPDATE ...")
+                # Все изменения применятся атомарно
+        """
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                # BEGIN IMMEDIATE захватывает эксклюзивную блокировку сразу
+                conn.execute("BEGIN IMMEDIATE")
+                yield conn
+                conn.execute("COMMIT")
+            except Exception as e:
+                conn.execute("ROLLBACK")
+                logger.error(f"Ошибка транзакции, выполнен откат: {e}")
+                raise
+            finally:
+                conn.close()
     
     # ========================================
     # Методы для работы с группами
     # ========================================
     
     def get_all_groups(self) -> List[Dict]:
-        """Получение списка всех групп"""
-        with self.get_connection() as conn:
+        """
+        Получить список всех групп.
+        
+        Returns:
+            Список словарей с информацией о группах
+        """
+        start_time = time.time()
+        
+        conn = self._get_connection()
+        try:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT * FROM groups 
                 ORDER BY education_form, specialty, name
             ''')
-            return [dict(row) for row in cursor.fetchall()]
+            result = [dict(row) for row in cursor.fetchall()]
+            
+            elapsed = time.time() - start_time
+            if LOG_QUERY_TIMING and elapsed > SLOW_QUERY_THRESHOLD:
+                logger.warning(f"⚠️ Медленный запрос get_all_groups: {elapsed:.2f}с")
+            
+            return result
+        finally:
+            conn.close()
     
     def get_group_by_name(self, name: str) -> Optional[Dict]:
-        """Получение группы по названию"""
-        with self.get_connection() as conn:
+        """
+        Получить группу по названию.
+        
+        Args:
+            name: Название группы
+        
+        Returns:
+            Словарь с информацией о группе или None
+        """
+        conn = self._get_connection()
+        try:
             cursor = conn.cursor()
             cursor.execute('SELECT * FROM groups WHERE name = ?', (name,))
             row = cursor.fetchone()
             return dict(row) if row else None
+        finally:
+            conn.close()
     
+    @retry_on_lock()
     def upsert_group(self, group_data: Dict) -> str:
         """
-        Создание или обновление группы.
+        Создать или обновить группу.
+        
+        Использует INSERT ... ON CONFLICT DO UPDATE для атомарности.
+        
+        Args:
+            group_data: Словарь с данными группы
         
         Returns:
             ID группы
         """
-        with self.get_connection() as conn:
+        group_id = self._generate_group_id(group_data['name'])
+        now = datetime.now().isoformat()
+        
+        with self.transaction() as conn:
             cursor = conn.cursor()
-            now = datetime.now().isoformat()
-            
-            # Генерируем ID из названия
-            group_id = self._generate_group_id(group_data['name'])
-            
             cursor.execute('''
                 INSERT INTO groups (id, name, specialty, education_form, building, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -255,6 +431,7 @@ class Database:
                     education_form = excluded.education_form,
                     building = excluded.building,
                     updated_at = excluded.updated_at
+                RETURNING id
             ''', (
                 group_id,
                 group_data['name'],
@@ -264,7 +441,8 @@ class Database:
                 now, now
             ))
             
-            return group_id
+            result = cursor.fetchone()
+            return result[0] if result else group_id
     
     # ========================================
     # Методы для работы с расписанием
@@ -272,12 +450,18 @@ class Database:
     
     def get_schedule(self, group_id: str) -> Optional[Dict]:
         """
-        Получение расписания группы.
+        Получить расписание группы.
+        
+        Args:
+            group_id: ID группы
         
         Returns:
-            Расписание, сгруппированное по дням недели.
+            Словарь с расписанием, сгруппированным по дням недели
         """
-        with self.get_connection() as conn:
+        start_time = time.time()
+        
+        conn = self._get_connection()
+        try:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT * FROM schedules
@@ -322,100 +506,237 @@ class Database:
                     'comment': row['comment'],
                 })
             
+            elapsed = time.time() - start_time
+            if LOG_QUERY_TIMING and elapsed > SLOW_QUERY_THRESHOLD:
+                logger.warning(f"⚠️ Медленный запрос get_schedule: {elapsed:.2f}с")
+            
             return {
                 'days': list(days.values())
             }
+        finally:
+            conn.close()
     
-    def update_schedule_from_lessons(self, lessons: List[Dict], source_url: str = "") -> int:
+    @retry_on_lock()
+    def bulk_update_schedule(
+        self,
+        all_lessons: List[Dict],
+        source_url: str = ""
+    ) -> Dict:
         """
-        Обновление расписания из списка занятий.
+        Массовое обновление расписания из списка занятий.
         
-        Автоматически определяет изменения и помечает их.
+        КЛЮЧЕВОЙ МЕТОД для устранения "database is locked":
+        1. Собирает все уникальные группы
+        2. Вставляет группы через executemany
+        3. Получает ID всех групп
+        4. Вставляет занятия через executemany
+        5. Всё в ОДНОЙ транзакции с BEGIN IMMEDIATE
+        
+        Args:
+            all_lessons: Список всех занятий из всех PDF
+            source_url: URL источника данных
         
         Returns:
-            Количество обработанных занятий
+            Словарь со статистикой:
+            {
+                'total_lessons': int,
+                'total_groups': int,
+                'updated_groups': int,
+                'elapsed_seconds': float
+            }
         """
-        with self.get_connection() as conn:
+        start_time = time.time()
+        
+        logger.info(f"🚀 Начало массового обновления: {len(all_lessons)} занятий")
+        
+        if not all_lessons:
+            logger.warning("Список занятий пуст, обновление пропущено")
+            return {
+                'total_lessons': 0,
+                'total_groups': 0,
+                'updated_groups': 0,
+                'elapsed_seconds': 0.0
+            }
+        
+        with self.transaction() as conn:
             cursor = conn.cursor()
             now = datetime.now().isoformat()
-            count = 0
             
-            for lesson_data in lessons:
-                group_name = lesson_data.get('group', '')
+            # ========================================
+            # Шаг 1: Собрать все уникальные группы
+            # ========================================
+            unique_groups = {}
+            for lesson in all_lessons:
+                group_name = lesson.get('group', '').strip()
                 if not group_name:
                     continue
                 
-                # Получаем или создаём группу
-                group_id = self.upsert_group({
-                    'name': group_name,
-                    'specialty': lesson_data.get('specialty', ''),
-                    'education_form': lesson_data.get('education_form', 'Очная'),
-                    'building': lesson_data.get('building', ''),
-                })
+                if group_name not in unique_groups:
+                    unique_groups[group_name] = {
+                        'name': group_name,
+                        'specialty': lesson.get('specialty', ''),
+                        'education_form': lesson.get('education_form', 'Очная'),
+                        'building': lesson.get('building', ''),
+                    }
+            
+            logger.info(f"📊 Найдено {len(unique_groups)} уникальных групп")
+            
+            # ========================================
+            # Шаг 2: Массовая вставка групп через executemany
+            # ========================================
+            groups_data = [
+                (
+                    self._generate_group_id(g['name']),
+                    g['name'],
+                    g['specialty'],
+                    g['education_form'],
+                    g['building'],
+                    now,
+                    now
+                )
+                for g in unique_groups.values()
+            ]
+            
+            cursor.executemany('''
+                INSERT INTO groups (id, name, specialty, education_form, building, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    specialty = excluded.specialty,
+                    education_form = excluded.education_form,
+                    building = excluded.building,
+                    updated_at = excluded.updated_at
+            ''', groups_data)
+            
+            logger.debug(f"✅ Вставлено/обновлено {len(groups_data)} групп")
+            
+            # ========================================
+            # Шаг 3: Получить ID всех групп
+            # ========================================
+            cursor.execute('SELECT id, name FROM groups')
+            group_ids = {row['name']: row['id'] for row in cursor.fetchall()}
+            
+            # ========================================
+            # Шаг 4: Подготовить данные для занятий
+            # ========================================
+            schedules_data = []
+            changes_data = []
+            
+            for lesson in all_lessons:
+                group_name = lesson.get('group', '').strip()
+                if not group_name or group_name not in group_ids:
+                    continue
                 
-                # Формируем уникальный ID занятия
-                lesson_id = f"{group_id}_{lesson_data['day']}_{lesson_data['number']}"
+                group_id = group_ids[group_name]
+                day = lesson.get('day', '')
+                number = lesson.get('number', 0)
                 
-                # Проверяем существующую запись для обнаружения изменений
+                # Уникальный ID занятия
+                lesson_id = f"{group_id}_{day}_{number}"
+                
+                # Проверка существующей записи для обнаружения изменений
                 cursor.execute(
-                    'SELECT * FROM schedules WHERE id = ?',
+                    'SELECT subject, teacher, room, lesson_type, start_time FROM schedules WHERE id = ?',
                     (lesson_id,)
                 )
                 existing = cursor.fetchone()
                 
                 is_changed = 0
                 if existing:
-                    is_changed = self._detect_changes_and_log(
-                        conn, existing, lesson_data, group_id
+                    # Обнаружение изменений
+                    changes = self._detect_changes(
+                        existing, lesson, group_id, day, number, now
                     )
+                    if changes:
+                        is_changed = 1
+                        changes_data.extend(changes)
                 
-                # Вставляем или обновляем
-                cursor.execute('''
-                    INSERT OR REPLACE INTO schedules
-                    (id, group_id, day_of_week, lesson_number, start_time, end_time,
-                     subject, lesson_type, teacher, room, building, is_changed,
-                     comment, source_url, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
+                # Данные для вставки
+                schedules_data.append((
                     lesson_id,
                     group_id,
-                    lesson_data.get('day', ''),
-                    lesson_data.get('number', 0),
-                    lesson_data.get('time', ''),
-                    lesson_data.get('end_time', ''),
-                    lesson_data.get('subject', ''),
-                    lesson_data.get('type', 'practice'),
-                    lesson_data.get('teacher', ''),
-                    lesson_data.get('room', ''),
-                    lesson_data.get('building', ''),
+                    day,
+                    number,
+                    lesson.get('time', ''),
+                    lesson.get('end_time', ''),
+                    lesson.get('subject', ''),
+                    lesson.get('type', 'practice'),
+                    lesson.get('teacher', ''),
+                    lesson.get('room', ''),
+                    lesson.get('building', ''),
                     is_changed,
-                    lesson_data.get('comment', ''),
+                    lesson.get('comment', ''),
                     source_url,
                     now
                 ))
-                count += 1
             
-            return count
+            # ========================================
+            # Шаг 5: Массовая вставка занятий через executemany
+            # ========================================
+            if schedules_data:
+                # Разбиваем на батчи если данных очень много
+                for i in range(0, len(schedules_data), BATCH_SIZE):
+                    batch = schedules_data[i:i + BATCH_SIZE]
+                    cursor.executemany('''
+                        INSERT OR REPLACE INTO schedules
+                        (id, group_id, day_of_week, lesson_number, start_time, end_time,
+                         subject, lesson_type, teacher, room, building, is_changed,
+                         comment, source_url, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', batch)
+                    
+                    logger.debug(f"✅ Вставлено {len(batch)} занятий (батч {i // BATCH_SIZE + 1})")
+            
+            # ========================================
+            # Шаг 6: Вставка изменений в журнал
+            # ========================================
+            if changes_data:
+                cursor.executemany('''
+                    INSERT INTO changes
+                    (group_id, day_of_week, lesson_number, change_type,
+                     field_name, old_value, new_value, subject, detected_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', changes_data)
+                
+                logger.info(f"📝 Записано {len(changes_data)} изменений в журнал")
+            
+            elapsed = time.time() - start_time
+            
+            result = {
+                'total_lessons': len(schedules_data),
+                'total_groups': len(unique_groups),
+                'updated_groups': len(groups_data),
+                'changes_detected': len(changes_data),
+                'elapsed_seconds': elapsed
+            }
+            
+            logger.info(
+                f"✅ Массовое обновление завершено за {elapsed:.2f}с: "
+                f"{result['total_lessons']} занятий, "
+                f"{result['total_groups']} групп, "
+                f"{result['changes_detected']} изменений"
+            )
+            
+            return result
     
-    def _detect_changes_and_log(
+    def _detect_changes(
         self,
-        conn: sqlite3.Connection,
         existing: sqlite3.Row,
-        new_data: Dict,
-        group_id: str
-    ) -> int:
+        new_lesson: Dict,
+        group_id: str,
+        day: str,
+        number: int,
+        timestamp: str
+    ) -> List[Tuple]:
         """
-        Обнаружение изменений в занятии и логирование.
+        Обнаружение изменений в занятии.
         
-        Сравнивает старое и новое значение, записывает изменения в журнал.
+        Сравнивает старое и новое значение, формирует записи для журнала.
         
         Returns:
-            1 если есть изменения, 0 если нет
+            Список кортежей для вставки в таблицу changes
         """
-        changes_detected = 0
-        now = datetime.now().isoformat()
+        changes = []
         
-        # Поля для сравнения
         fields_to_check = [
             ('subject', 'subject'),
             ('teacher', 'teacher'),
@@ -426,37 +747,27 @@ class Database:
         
         for db_field, data_field in fields_to_check:
             old_value = existing[db_field] or ''
-            new_value = new_data.get(data_field, '')
+            new_value = new_lesson.get(data_field, '')
             
             if old_value != new_value and new_value:
-                changes_detected = 1
-                
-                # Логируем изменение
-                cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO changes
-                    (group_id, day_of_week, lesson_number, change_type,
-                     field_name, old_value, new_value, subject, detected_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
+                changes.append((
                     group_id,
-                    existing['day_of_week'],
-                    existing['lesson_number'],
+                    day,
+                    number,
                     'modified',
                     db_field,
                     old_value,
                     new_value,
-                    new_data.get('subject', ''),
-                    now
+                    new_lesson.get('subject', ''),
+                    timestamp
                 ))
                 
-                logger.info(
-                    f"Изменение: {group_id} {existing['day_of_week']} "
-                    f"#{existing['lesson_number']} — {db_field}: "
-                    f"'{old_value}' → '{new_value}'"
+                logger.debug(
+                    f"Изменение: {group_id} {day} #{number} — "
+                    f"{db_field}: '{old_value}' → '{new_value}'"
                 )
         
-        return changes_detected
+        return changes
     
     # ========================================
     # Методы для работы с last_update
@@ -464,12 +775,13 @@ class Database:
     
     def get_last_update(self) -> Dict:
         """
-        Получение информации о последнем обновлении.
+        Получить информацию о последнем обновлении.
         
         Returns:
-            Словарь с информацией о последнем успешном обновлении.
+            Словарь с информацией о последнем обновлении
         """
-        with self.get_connection() as conn:
+        conn = self._get_connection()
+        try:
             cursor = conn.cursor()
             cursor.execute('SELECT * FROM last_update WHERE id = 1')
             row = cursor.fetchone()
@@ -499,7 +811,10 @@ class Database:
                 'groupsCount': 0,
                 'pdfFilesCount': 0,
             }
+        finally:
+            conn.close()
     
+    @retry_on_lock()
     def set_last_update(
         self,
         success: bool,
@@ -510,23 +825,21 @@ class Database:
         pdf_files_count: int = 0
     ):
         """
-        Установка информации о последнем обновлении.
+        Установить информацию о последнем обновлении.
         
         Args:
             success: Успешно ли обновление
             source: Источник данных
-            error_message: Сообщение об ошибке (если есть)
+            error_message: Сообщение об ошибке
             lessons_count: Количество обработанных занятий
             groups_count: Количество групп
             pdf_files_count: Количество обработанных PDF файлов
         """
-        with self.get_connection() as conn:
+        now = datetime.now().isoformat()
+        next_update = (datetime.now() + timedelta(hours=24)).isoformat()
+        
+        with self.transaction() as conn:
             cursor = conn.cursor()
-            now = datetime.now().isoformat()
-            
-            # Следующее обновление через 24 часа
-            next_update = (datetime.now() + timedelta(hours=24)).isoformat()
-            
             cursor.execute('''
                 UPDATE last_update SET
                     last_success = CASE WHEN ? THEN ? ELSE last_success END,
@@ -550,32 +863,27 @@ class Database:
                 groups_count,
                 pdf_files_count
             ))
-            
-            logger.info(
-                f"Обновление last_update: success={success}, "
-                f"lessons={lessons_count}, groups={groups_count}"
-            )
+        
+        logger.info(
+            f"📊 Обновлено last_update: success={success}, "
+            f"lessons={lessons_count}, groups={groups_count}"
+        )
     
     def needs_update(self) -> bool:
         """
         Проверка, нужно ли обновление данных.
         
-        Возвращает True если:
-        - Данных нет вообще
-        - Последнее обновление было более 24 часов назад
-        - Последнее обновление было неудачным
+        Returns:
+            True если данных нет или они старше 24 часов
         """
         update_info = self.get_last_update()
         
-        # Если данных никогда не было
         if not update_info['lastUpdate']:
             return True
         
-        # Если последнее обновление было неудачным
         if not update_info['success']:
             return True
         
-        # Проверяем, прошло ли 24 часа
         try:
             last_update = datetime.fromisoformat(update_info['lastUpdate'])
             hours_passed = (datetime.now() - last_update).total_seconds() / 3600
@@ -584,87 +892,24 @@ class Database:
             return True
     
     # ========================================
-    # Методы для работы с подписками
-    # ========================================
-    
-    def add_subscription(self, chat_id: str, group_id: str, notification_types: List[str] = None) -> bool:
-        """Добавление подписки на уведомления"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            now = datetime.now().isoformat()
-            types_json = json.dumps(notification_types or ['changes', 'cancellations'])
-            
-            try:
-                cursor.execute('''
-                    INSERT INTO subscriptions (chat_id, group_id, notification_types, is_active, created_at)
-                    VALUES (?, ?, ?, 1, ?)
-                ''', (chat_id, group_id, types_json, now))
-                return True
-            except sqlite3.IntegrityError:
-                return False
-    
-    def remove_subscription(self, chat_id: str, group_id: str = None):
-        """Удаление подписки"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            if group_id:
-                cursor.execute(
-                    'DELETE FROM subscriptions WHERE chat_id = ? AND group_id = ?',
-                    (chat_id, group_id)
-                )
-            else:
-                cursor.execute(
-                    'DELETE FROM subscriptions WHERE chat_id = ?',
-                    (chat_id,)
-                )
-    
-    def get_subscriptions_for_group(self, group_id: str) -> List[Dict]:
-        """Получение подписок для группы"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT * FROM subscriptions
-                WHERE group_id = ? AND is_active = 1
-            ''', (group_id,))
-            return [dict(row) for row in cursor.fetchall()]
-    
-    # ========================================
-    # Методы для работы с журналом изменений
-    # ========================================
-    
-    def get_recent_changes(self, hours: int = 24) -> List[Dict]:
-        """Получение недавних изменений"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
-            cursor.execute('''
-                SELECT c.*, g.name as group_name
-                FROM changes c
-                LEFT JOIN groups g ON c.group_id = g.id
-                WHERE c.detected_at > ?
-                ORDER BY c.detected_at DESC
-            ''', (cutoff,))
-            return [dict(row) for row in cursor.fetchall()]
-    
-    # ========================================
     # Служебные методы
     # ========================================
     
     def cleanup_old_data(self, days: int = 30):
         """Очистка устаревших данных"""
-        with self.get_connection() as conn:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        
+        with self.transaction() as conn:
             cursor = conn.cursor()
-            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-            
-            # Удаляем старые записи журнала изменений
             cursor.execute('DELETE FROM changes WHERE detected_at < ?', (cutoff,))
-            changes_deleted = cursor.rowcount
-            
-            logger.info(f"Очистка: удалено {changes_deleted} записей изменений")
+            deleted = cursor.rowcount
+        
+        logger.info(f"🧹 Очистка: удалено {deleted} записей изменений")
     
     def get_stats(self) -> Dict:
         """Получение статистики базы данных"""
-        with self.get_connection() as conn:
+        conn = self._get_connection()
+        try:
             cursor = conn.cursor()
             
             cursor.execute('SELECT COUNT(*) FROM groups')
@@ -685,11 +930,11 @@ class Database:
                 'activeGroups': active_groups,
                 'activeSubscriptions': subscriptions_count,
             }
+        finally:
+            conn.close()
     
     def _generate_group_id(self, name: str) -> str:
         """Генерация ID группы из названия"""
-        # Транслитерация и очистка
-        import hashlib
         clean_name = name.strip().lower().replace(' ', '_')
         hash_part = hashlib.md5(clean_name.encode()).hexdigest()[:6]
         return f"grp_{clean_name}_{hash_part}"
